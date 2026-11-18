@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>수테크 AR 시험판</title>
+<style>
+  :root{--accent:#e9780a;--ink:#ffffff;--dim:rgba(0,0,0,.55)}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#000;color:var(--ink);font-family:"Noto Sans KR",system-ui,-apple-system,"Apple SD Gothic Neo","Malgun Gothic",sans-serif;overflow:hidden}
+  #ar{position:fixed;inset:0}
+  .top{position:fixed;top:0;left:0;right:0;padding:calc(env(safe-area-inset-top,0px) + 12px) 16px 12px;display:flex;justify-content:center;z-index:5;pointer-events:none}
+  .top b{font-size:20px;letter-spacing:.12em;text-shadow:0 2px 8px rgba(0,0,0,.6)}
+  .top b span{color:var(--accent)}
+  #guide{position:fixed;inset:0;display:grid;place-items:center;z-index:4;pointer-events:none}
+  #guide .box{width:min(84vw,84vh*1.5);aspect-ratio:3/2;border:3px dashed rgba(255,255,255,.85);border-radius:12px;position:relative}
+  #guide .box::after{content:"";position:absolute;left:12%;top:16%;width:20%;height:66%;border:3px solid var(--accent);border-radius:50%}
+  #guide p{position:fixed;bottom:calc(env(safe-area-inset-bottom,0px) + 28px);left:16px;right:16px;text-align:center;margin:0;font-size:16px;text-shadow:0 2px 8px #000}
+  #start{position:fixed;inset:0;z-index:10;display:grid;place-items:center;background:#111;padding:24px}
+  #start .card{max-width:420px;display:grid;gap:14px;text-align:center}
+  #start h1{margin:0;font-size:26px}
+  #start h1 span{color:var(--accent)}
+  #start p{margin:0;color:#c7ccd4;line-height:1.6;font-size:15px}
+  #start button{font:inherit;font-weight:700;font-size:17px;padding:14px 18px;border-radius:12px;border:0;background:var(--accent);color:#fff;cursor:pointer}
+  #start button:disabled{opacity:.5}
+  #status{min-height:1.5em;color:#ffd7ad}
+  [hidden]{display:none!important}
+</style>
+<script src="target_data.js"></script>
+<script type="importmap">
+{"imports":{
+  "three":"https://unpkg.com/three@0.147.0/build/three.module.js",
+  "three/addons/":"https://unpkg.com/three@0.147.0/examples/jsm/",
+  "mindar-image":"https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image.prod.js",
+  "mindar-image-three":"https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js"
+}}
+</script>
+</head>
+<body>
+<div id="ar"></div>
+<div class="top"><b>SU<span>TECH</span> AR</b></div>
+<div id="guide" hidden><div class="box"></div><p>PTP 그림 전체가 점선 안에 꽉 차게 비춰 주세요</p></div>
+
+<div id="start">
+  <div class="card">
+    <h1>수테크 <span>AR</span> 시험판</h1>
+    <p>PTP 프레임 그림을 모니터에 띄우거나 인쇄해 두고, 이 화면에서 카메라로 비춥니다. 왼쪽 작은 흰 칸 자리에 로봇셀이 들어 있는 액자가 나타납니다.</p>
+    <button id="go">카메라 켜고 시작</button>
+    <p id="status"></p>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from "three";
+import { MindARThree } from "mindar-image-three";
+import { Compiler } from "mindar-image";
+
+const $ = id => document.getElementById(id);
+const status = t => { $("status").textContent = t; };
+
+// Target image is 2000x1333; MindAR anchor units: width = 1, centred.
+const TW = 2000, TH = 1333, H = TH / TW;
+const px = x => x / TW - 0.5;          // image x(px) -> anchor x
+const py = y => (0.5 - y / TH) * H;    // image y(px) -> anchor y
+// Portal sits on the left white window (x 340..660, y 450..883)
+const P = { x: px(500), y: py(666), rx: 160 / TW * 1.08, ry: 216 / TW * 1.08 };
+
+async function compileTarget(){
+  const img = new Image();
+  img.src = window.TARGET_SRC;
+  await img.decode();
+  const compiler = new Compiler();
+  await compiler.compileImageTargets([img], p => status(`그림 준비 중 ${Math.round(p)}% (처음 한 번, 10초 정도)`));
+  const data = await compiler.exportData();
+  return URL.createObjectURL(new Blob([data]));
+}
+
+function canvasTex(w, h, draw){
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  draw(c.getContext("2d"), w, h);
+  const t = new THREE.CanvasTexture(c); t.encoding = THREE.sRGBEncoding; return t;
+}
+
+// Everything inside the portal only draws where the oval mask wrote stencil = 1
+function inPortal(mat){
+  mat.stencilWrite = true; mat.stencilRef = 1;
+  mat.stencilFunc = THREE.EqualStencilFunc;
+  mat.stencilFail = THREE.KeepStencilOp; mat.stencilZFail = THREE.KeepStencilOp; mat.stencilZPass = THREE.KeepStencilOp;
+  return mat;
+}
+
+function buildPortal(group){
+  // 1) mask: invisible oval that marks the window
+  const shape = new THREE.Shape(); shape.absellipse(0, 0, P.rx, P.ry, 0, Math.PI * 2);
+  const maskMat = new THREE.MeshBasicMaterial({ colorWrite:false, depthWrite:false,
+    stencilWrite:true, stencilRef:1, stencilFunc:THREE.AlwaysStencilFunc,
+    stencilZPass:THREE.ReplaceStencilOp });
+  const mask = new THREE.Mesh(new THREE.ShapeGeometry(shape, 64), maskMat);
+  mask.position.set(P.x, P.y, 0.001); mask.renderOrder = 1; group.add(mask);
+
+  const room = new THREE.Group(); room.position.set(P.x, P.y, 0); group.add(room);
+  const W = 0.62, Hh = 0.62, D = 0.75;
+
+  // 2) the room behind the window: walls, floor, ceiling (inside faces)
+  const wallTex = canvasTex(512, 512, (g, w, h) => {
+    const gr = g.createLinearGradient(0, 0, 0, h); gr.addColorStop(0, "#1b2a44"); gr.addColorStop(1, "#0e1626");
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    g.strokeStyle = "rgba(255,255,255,.08)"; g.lineWidth = 2;
+    for (let i = 0; i < w; i += 32){ g.beginPath(); g.moveTo(i, 0); g.lineTo(i, h); g.stroke(); }
+    g.fillStyle = "rgba(255,214,140,.55)";
+    for (let i = 0; i < 4; i++) g.fillRect(40 + i * 120, 60, 70, 46);
+  });
+  const roomMat = inPortal(new THREE.MeshStandardMaterial({ map: wallTex, side: THREE.BackSide, roughness: .9 }));
+  const box = new THREE.Mesh(new THREE.BoxGeometry(W, Hh, D), roomMat);
+  box.position.z = -D / 2 - 0.002; box.renderOrder = 2; room.add(box);
+
+  // back wall sign
+  const signTex = canvasTex(512, 160, (g, w, h) => {
+    g.fillStyle = "#e9780a"; g.fillRect(0, 0, w, h);
+    g.fillStyle = "#fff"; g.font = "bold 92px sans-serif"; g.textAlign = "center"; g.textBaseline = "middle";
+    g.fillText("SUTECH", w / 2, h / 2 + 4);
+  });
+  const sign = new THREE.Mesh(new THREE.PlaneGeometry(0.28, 0.0875), inPortal(new THREE.MeshBasicMaterial({ map: signTex })));
+  sign.position.set(0, Hh / 2 - 0.09, -D + 0.01); sign.renderOrder = 3; room.add(sign);
+
+  const orange = () => inPortal(new THREE.MeshStandardMaterial({ color: 0xe9780a, roughness: .45, metalness: .2 }));
+  const grey = () => inPortal(new THREE.MeshStandardMaterial({ color: 0x3d3f43, roughness: .7 }));
+
+  // 3) conveyor
+  const belt = new THREE.Mesh(new THREE.BoxGeometry(W * 0.95, 0.02, 0.09), grey());
+  belt.position.set(0, -Hh / 2 + 0.08, -0.32); belt.renderOrder = 3; room.add(belt);
+  const boxes = [];
+  for (let i = 0; i < 4; i++){
+    const b = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.045, 0.06),
+      inPortal(new THREE.MeshStandardMaterial({ color: 0xc89b62, roughness: .8 })));
+    b.position.set(-W / 2 + i * 0.16, -Hh / 2 + 0.115, -0.32); b.renderOrder = 3; room.add(b); boxes.push(b);
+  }
+
+  // 4) robot arm (base, shoulder, upper arm, forearm, gripper)
+  const arm = new THREE.Group(); arm.position.set(0.04, -Hh / 2 + 0.02, -0.5); room.add(arm);
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.06, 0.05, 24), grey()); base.position.y = 0.025; arm.add(base);
+  const yaw = new THREE.Group(); yaw.position.y = 0.05; arm.add(yaw);
+  const shoulder = new THREE.Group(); shoulder.position.y = 0.04; yaw.add(shoulder);
+  const upper = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.2, 0.035), orange()); upper.position.y = 0.1; shoulder.add(upper);
+  const elbow = new THREE.Group(); elbow.position.y = 0.2; shoulder.add(elbow);
+  const fore = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.17, 0.03), orange()); fore.position.y = 0.085; elbow.add(fore);
+  const grip = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.02, 0.03), grey()); grip.position.y = 0.175; elbow.add(grip);
+  [arm, base, upper, fore, grip].forEach(m => { if (m.isMesh) m.renderOrder = 3; });
+
+  // 5) sparks drifting in front
+  const N = 120, pos = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++){ pos[i*3] = (Math.random()-.5)*W; pos[i*3+1] = (Math.random()-.5)*Hh; pos[i*3+2] = -Math.random()*D*0.9; }
+  const pg = new THREE.BufferGeometry(); pg.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  const sparks = new THREE.Points(pg, inPortal(new THREE.PointsMaterial({ color: 0xffd08a, size: 0.008, transparent: true, opacity: .9, depthWrite:false })));
+  sparks.renderOrder = 4; room.add(sparks);
+
+  // 6) the frame around the window (drawn on top, outside the stencil)
+  const frameTex = canvasTex(512, 640, (g, w, h) => {
+    const cx = w / 2, cy = h / 2, rx = w * 0.40, ry = h * 0.40;
+    g.lineWidth = 34; g.strokeStyle = "#e9780a";
+    g.beginPath(); g.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); g.stroke();
+    g.lineWidth = 6; g.strokeStyle = "#3d3f43";
+    g.beginPath(); g.ellipse(cx, cy, rx + 22, ry + 22, 0, 0, Math.PI * 2); g.stroke();
+    g.beginPath(); g.ellipse(cx, cy, rx - 20, ry - 20, 0, 0, Math.PI * 2); g.stroke();
+    g.fillStyle = "#ffffff";
+    for (let a = 0; a < 36; a++){ const t = a / 36 * Math.PI * 2; g.beginPath(); g.arc(cx + Math.cos(t) * rx, cy + Math.sin(t) * ry, 5, 0, Math.PI * 2); g.fill(); }
+    g.fillStyle = "#3d3f43"; g.fillRect(cx - 120, 8, 240, 56);
+    g.fillStyle = "#fff"; g.font = "bold 40px sans-serif"; g.textAlign = "center"; g.textBaseline = "middle"; g.fillText("SUTECH", cx, 37);
+  });
+  const fw = P.rx * 2 / 0.80, fh = P.ry * 2 / 0.80;
+  const frame = new THREE.Mesh(new THREE.PlaneGeometry(fw, fh), new THREE.MeshBasicMaterial({ map: frameTex, transparent: true, depthWrite:false }));
+  frame.position.set(P.x, P.y, 0.004); frame.renderOrder = 10; group.add(frame);
+
+  return { boxes, yaw, shoulder, elbow, sparks, W, Hh, D };
+}
+
+$("go").addEventListener("click", async () => {
+  $("go").disabled = true;
+  try{
+    if (!window.TARGET_SRC) throw new Error("필요한 파일을 불러오지 못했습니다. 인터넷 연결을 확인하세요.");
+    const targetUrl = await compileTarget();
+    status("카메라를 켜는 중…");
+    const mindar = new MindARThree({ container: $("ar"), imageTargetSrc: targetUrl, uiScanning: "no", uiLoading: "no", filterMinCF: 0.0005, filterBeta: 0.01 });
+    const { renderer, scene, camera } = mindar;
+    renderer.outputEncoding = THREE.sRGBEncoding;
+    scene.add(new THREE.AmbientLight(0xffffff, 0.75));
+    const sun = new THREE.DirectionalLight(0xffffff, 0.9); sun.position.set(0.3, 1, 1); scene.add(sun);
+
+    const anchor = mindar.addAnchor(0);
+    const rig = buildPortal(anchor.group);
+    anchor.onTargetFound = () => { $("guide").hidden = true; };
+    anchor.onTargetLost = () => { $("guide").hidden = false; };
+
+    await mindar.start();
+    $("start").hidden = true; $("guide").hidden = false;
+
+    const clock = new THREE.Clock();
+    renderer.setAnimationLoop(() => {
+      const t = clock.getElapsedTime();
+      rig.boxes.forEach(b => { b.position.x += 0.0016; if (b.position.x > rig.W / 2) b.position.x = -rig.W / 2; });
+      rig.yaw.rotation.y = Math.sin(t * 0.8) * 0.9;
+      rig.shoulder.rotation.z = -0.35 + Math.sin(t * 1.1) * 0.35;
+      rig.elbow.rotation.z = 0.9 + Math.sin(t * 1.3 + 1) * 0.4;
+      const p = rig.sparks.geometry.attributes.position;
+      for (let i = 0; i < p.count; i++){ let y = p.getY(i) + 0.0012; if (y > rig.Hh / 2) y = -rig.Hh / 2; p.setY(i, y); }
+      p.needsUpdate = true;
+      renderer.render(scene, camera);
+    });
+  }catch(e){
+    console.error(e);
+    status("시작하지 못했습니다: " + (e && e.message ? e.message : e) + " — 카메라 허용 여부를 확인하고 새로고침해 주세요.");
+    $("go").disabled = false;
+  }
+});
+</script>
+</body>
+</html>
